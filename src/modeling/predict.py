@@ -87,10 +87,14 @@ def generate_prediction(model, tokenizer, prompt, max_new_tokens=128, temperatur
     Returns:
         Tuple of (predicted_text, score)
     """
-    # Tokenize prompt
-    inputs = tokenizer(prompt, return_tensors='pt', truncation=True, max_length=1024)
+    # Tokenize prompt with more aggressive truncation to avoid length issues
+    inputs = tokenizer(prompt, return_tensors='pt', truncation=True, max_length=512)
     input_ids = inputs['input_ids'].to(model.device)
     attention_mask = inputs['attention_mask'].to(model.device)
+    
+    # Safety check: ensure input length + max_new_tokens doesn't exceed model's limit
+    if input_ids.shape[1] + max_new_tokens > 1024:
+        max_new_tokens = max(10, 1024 - input_ids.shape[1])
     
     # Generate
     with torch.no_grad():
@@ -180,14 +184,14 @@ def predict_batch(model, tokenizer, test_data, batch_size=8, max_new_tokens=128)
 
 def save_predictions_csv(predictions, output_csv):
     """
-    Save predictions to CSV with EXACT required columns.
+    Save predictions to CSV matching benchmark_if_only.csv format.
     
     Columns:
-    1. Input provided to the model
-    2. Whether the prediction is correct (true/false)
-    3. Expected if condition
-    4. Predicted if condition
-    5. Prediction score (0-100)
+    1. id - sequential ID starting from 1
+    2. code - the expected if condition (ground truth)
+    3. code_tokens - empty list as JSON string
+    4. docstring - the predicted if condition
+    5. docstring_tokens - empty list as JSON string
     """
     output_dir = os.path.dirname(output_csv)
     if output_dir:  # Only create directory if path has a directory component
@@ -196,23 +200,23 @@ def save_predictions_csv(predictions, output_csv):
     with open(output_csv, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         
-        # Write header with EXACT column names
+        # Write header matching benchmark format
         writer.writerow([
-            'Input provided to the model',
-            'Whether the prediction is correct (true/false)',
-            'Expected if condition',
-            'Predicted if condition',
-            'Prediction score (0-100)',
+            'id',
+            'code',
+            'code_tokens',
+            'docstring',
+            'docstring_tokens',
         ])
         
         # Write predictions
-        for pred in predictions:
+        for idx, pred in enumerate(predictions, start=1):
             writer.writerow([
-                pred['prompt'],
-                'true' if pred['correct'] else 'false',
-                pred['expected'],
-                pred['predicted'],
-                f"{pred['score']:.2f}",
+                idx,
+                pred['expected'],  # ground truth as 'code'
+                '[]',  # empty code_tokens
+                pred['predicted'],  # prediction as 'docstring'
+                '[]',  # empty docstring_tokens
             ])
     
     print(f"Saved {len(predictions)} predictions to: {output_csv}")

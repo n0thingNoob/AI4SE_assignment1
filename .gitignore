@@ -1,6 +1,6 @@
 # Data and artifacts - DO NOT COMMIT
-data/
-artifacts/
+/data/
+/artifacts/
 *.csv
 *.jsonl
 *.txt
