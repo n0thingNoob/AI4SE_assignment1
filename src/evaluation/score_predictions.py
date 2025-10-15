@@ -13,29 +13,44 @@ import numpy as np
 
 def load_predictions_csv(csv_path):
     """
-    Load predictions from CSV.
+    Load predictions from CSV in benchmark format.
     
-    Expected columns:
-    1. Input provided to the model
-    2. Whether the prediction is correct (true/false)
-    3. Expected if condition
-    4. Predicted if condition
-    5. Prediction score (0-100)
+    Expected columns (benchmark_if_only.csv format):
+    1. id - sequential ID
+    2. code - expected if condition (ground truth)
+    3. code_tokens - empty list
+    4. docstring - predicted if condition
+    5. docstring_tokens - empty list
     """
     predictions = []
     
     with open(csv_path, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         for row in reader:
+            expected = row['code'].strip()
+            predicted = row['docstring'].strip()
+            
+            # Normalize for comparison
+            expected_norm = normalize_condition(expected)
+            predicted_norm = normalize_condition(predicted)
+            correct = (expected_norm == predicted_norm)
+            
             predictions.append({
-                'input': row['Input provided to the model'],
-                'correct': row['Whether the prediction is correct (true/false)'] == 'true',
-                'expected': row['Expected if condition'],
-                'predicted': row['Predicted if condition'],
-                'score': float(row['Prediction score (0-100)']),
+                'id': row['id'],
+                'expected': expected,
+                'predicted': predicted,
+                'correct': correct,
+                'score': 100.0 if correct else 0.0,  # Simple binary score
             })
     
     return predictions
+
+
+def normalize_condition(text):
+    """Normalize if condition for comparison."""
+    # Remove extra whitespace and newlines
+    normalized = ' '.join(text.split())
+    return normalized.strip()
 
 
 def compute_metrics(predictions):
