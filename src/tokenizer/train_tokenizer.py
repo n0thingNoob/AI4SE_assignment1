@@ -72,6 +72,9 @@ def train_tokenizer(
     # Convert to HuggingFace format
     print("\nConverting to HuggingFace PreTrainedTokenizerFast...")
     
+    # Save as proper tokenizer.json file
+    tokenizer.save(os.path.join(output_dir, "tokenizer.json"))
+    
     # Load as PreTrainedTokenizerFast
     fast_tokenizer = PreTrainedTokenizerFast(
         tokenizer_file=os.path.join(output_dir, "tokenizer.json"),

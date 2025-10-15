@@ -189,7 +189,9 @@ def save_predictions_csv(predictions, output_csv):
     4. Predicted if condition
     5. Prediction score (0-100)
     """
-    os.makedirs(os.path.dirname(output_csv), exist_ok=True)
+    output_dir = os.path.dirname(output_csv)
+    if output_dir:  # Only create directory if path has a directory component
+        os.makedirs(output_dir, exist_ok=True)
     
     with open(output_csv, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)

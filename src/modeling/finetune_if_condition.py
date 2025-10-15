@@ -196,7 +196,7 @@ def finetune_model(
         logging_steps=50,
         save_steps=save_steps,
         eval_steps=eval_steps,
-        evaluation_strategy='steps',
+        eval_strategy='steps',  # Changed from evaluation_strategy
         save_total_limit=3,
         load_best_model_at_end=True,
         metric_for_best_model='eval_loss',
