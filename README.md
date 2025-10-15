@@ -47,6 +47,13 @@ pip install -r requirements.txt
 https://github.com/psf/requests
 https://github.com/django/django
 https://github.com/pallets/flask
+https://github.com/scikit-learn/scikit-learn
+https://github.com/pytorch/pytorch
+https://github.com/pandas-dev/pandas
+https://github.com/numpy/numpy
+https://github.com/python/cpython
+https://github.com/torvalds/linux
+https://github.com/tensorflow/tensorflow
 ```
 
 3. **Run the complete pipeline**:
@@ -54,7 +61,89 @@ https://github.com/pallets/flask
 bash scripts/quickstart.sh
 ```
 
-Or run individual steps:
+## Full-Scale Training Commands
+
+After testing and bug fixes, use these commands for production training with larger datasets:
+
+```bash
+# Step 1: Mine GitHub repositories (10-20 popular repos recommended)
+python src/data/mine_github.py \
+  --repos-file repos.txt \
+  --out-dir data/raw_repos
+
+# Step 2: Extract Python functions with if-statements
+python src/data/extract_functions.py \
+  --repos-root data/raw_repos \
+  --out data/functions.jsonl
+
+# Step 3: Build pre-training corpus from extracted functions
+python src/data/build_pretrain_corpus.py \
+  --functions data/functions.jsonl \
+  --out data/pretrain_corpus.txt
+
+# Step 4: Build fine-tuning dataset with masked if-conditions
+python src/data/build_finetune_dataset.py \
+  --functions data/functions.jsonl \
+  --out-prefix data/finetune
+
+# Step 5: Train custom Byte-level BPE tokenizer from scratch
+python src/tokenizer/train_tokenizer.py \
+  --corpus data/pretrain_corpus.txt \
+  --vocab-size 10000 \
+  --out-dir artifacts/tokenizer
+
+# Step 6: Pre-train GPT-2 model from scratch using Causal Language Modeling
+python src/modeling/pretrain_clm.py \
+  --tokenizer artifacts/tokenizer \
+  --corpus data/pretrain_corpus.txt \
+  --out-dir artifacts/pretrain_gpt2 \
+  --n-layer 6 \
+  --n-head 8 \
+  --n-embd 512 \
+  --batch-size 8 \
+  --epochs 5 \
+  --lr 5e-4
+
+# Step 7: Fine-tune pre-trained model for if-condition prediction
+python src/modeling/finetune_if_condition.py \
+  --tokenizer artifacts/tokenizer \
+  --pretrained artifacts/pretrain_gpt2 \
+  --train data/finetune_train.jsonl \
+  --val data/finetune_val.jsonl \
+  --out-dir artifacts/ifrec_finetuned \
+  --batch-size 8 \
+  --epochs 10 \
+  --lr 3e-5
+
+# Step 8: Generate predictions on test set
+python src/modeling/predict.py \
+  --tokenizer artifacts/tokenizer \
+  --model artifacts/ifrec_finetuned \
+  --test data/finetune_test.jsonl \
+  --out predictions.csv
+
+# Step 9: Evaluate prediction accuracy
+python src/evaluation/score_predictions.py \
+  --csv predictions.csv
+```
+
+**Expected Results with 10-20 Repositories:**
+- ~50,000+ functions extracted
+- ~100,000+ masked if-condition examples
+- ~10,000 vocabulary size
+- ~35-60% accuracy on test set
+- Training time: 2-6 hours (depends on hardware)
+
+**Monitoring Training:**
+```bash
+# Monitor training progress with TensorBoard
+tensorboard --logdir artifacts/pretrain_gpt2/logs
+tensorboard --logdir artifacts/ifrec_finetuned/logs
+```
+
+## Individual Steps (Alternative)
+
+For more control, run each step separately with default parameters:
 
 ```bash
 # 1. Mine GitHub repositories
