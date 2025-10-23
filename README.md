@@ -69,34 +69,34 @@ bash run_complete_pipeline.sh
 ```bash
 # 1. Build pre-training corpus
 python src/data/build_pretrain_corpus.py \
-  --functions data/functions_v2.jsonl \
-  --out data/pretrain_corpus_v3.txt \
+  --functions data/functions.jsonl \
+  --out data/pretrain_corpus.txt \
   --augment-ratio 0.08
 
 # 2. Train tokenizer
 python src/tokenizer/train_tokenizer.py \
-  --corpus data/pretrain_corpus_v3.txt \
-  --out-dir artifacts/tokenizer_v6_gpt2style
+  --corpus data/pretrain_corpus.txt \
+  --out-dir artifacts/tokenizer
 
 # 3. Pre-train model
 python src/modeling/pretrain_clm.py \
   --tokenizer artifacts/tokenizer_v6_gpt2style \
-  --corpus data/pretrain_corpus_v3.txt \
+  --corpus data/pretrain_corpus.txt \
   --out-dir artifacts/pretrained_model
 
 # 4. Fine-tune for if-condition prediction
 python src/modeling/finetune_if_condition.py \
-  --tokenizer artifacts/tokenizer_v6_gpt2style \
+  --tokenizer artifacts/tokenizer_gpt2style \
   --pretrained artifacts/pretrained_model \
-  --train data/finetune_v3_train_prepped.jsonl \
-  --val data/finetune_v3_val_prepped.jsonl \
+  --train data/finetune_train.jsonl \
+  --val data/finetune_val.jsonl \
   --out-dir artifacts/finetuned_model
 
 # 5. Generate predictions
 python src/modeling/predict.py \
-  --tokenizer artifacts/tokenizer_v6_gpt2style \
+  --tokenizer artifacts/tokenizer \
   --model artifacts/finetuned_model \
-  --test data/finetune_v3_test_prepped.jsonl \
+  --test data/finetune_test.jsonl \
   --out predictions.csv
 ```
 
