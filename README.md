@@ -156,14 +156,3 @@ The model achieves competitive performance on if-condition prediction through:
 - NumPy, Pandas
 - TQDM
 
-## 📝 Citation
-
-```bibtex
-@misc{ai4se_assignment1_2024,
-  title={If-Condition Prediction in Python Code using GPT-2},
-  author={Your Name},
-  year={2024},
-  howpublished={GitHub Repository}
-}
-```
-
