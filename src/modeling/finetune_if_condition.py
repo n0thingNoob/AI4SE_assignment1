@@ -51,6 +51,16 @@ from src.modeling.utils import is_correct_ast
 MAX_LEN = 384
 SPECIAL_TOKENS = ["<IFMASK>", "<ANS>", "<CODE>", "<TASK=IF_COND>"]
 
+# Put this near the top (module scope)
+_FIRST_CM_CALLED = False
+
+# ==== AST eval controls (env overridable) ====
+AST_EVAL_RATIO = float(os.getenv("AST_EVAL_RATIO", "0.1"))
+AST_EVAL_MIN   = int(os.getenv("AST_EVAL_MIN",   "100"))
+AST_EVAL_MAX   = int(os.getenv("AST_EVAL_MAX",   "500"))
+AST_EVAL_EVERY = int(os.getenv("AST_EVAL_EVERY", "1"))
+AST_EVAL_MAX_NEW = int(os.getenv("AST_EVAL_MAX_NEW", "64"))
+
 def load_jsonl(file_path: str) -> List[Dict[str, Any]]:
     """Load JSONL file."""
     data = []
@@ -67,6 +77,11 @@ def setup_tokenizer_and_model(tokenizer_path: str, pretrained_path: str):
     # Load tokenizer
     print(f"Loading tokenizer from: {tokenizer_path}")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    
+    # Keep tail where <IFMASK> and <ANS> live
+    tokenizer.truncation_side = "left"
+    tokenizer.padding_side = "left"
+    print(f"✅ Tokenizer truncation_side: {tokenizer.truncation_side}, padding_side: {tokenizer.padding_side}")
     
     # Fix PAD token issue
     if tokenizer.pad_token is None:
@@ -113,8 +128,17 @@ def setup_tokenizer_and_model(tokenizer_path: str, pretrained_path: str):
     
     return tokenizer, model
 
+def ensure_ans(prompt: str) -> str:
+    """确保 prompt 末尾恰好有一个 <ANS> 标记，避免重复。"""
+    p = prompt.rstrip()
+
+    if p.endswith("<ANS>"):
+        return p + " "
+    return p + " <ANS> "
+
 def encode_if_example(prefix_ctx: str, target_if: str, tokenizer) -> Dict[str, List[int]]:
-    inp = prefix_ctx.rstrip() + " <ANS> "
+    # 保证只有一个 <ANS>，若预处理已拼接，这里不会重复
+    inp = ensure_ans(prefix_ctx)
     tgt = target_if + tokenizer.eos_token
 
     inp_ids = tokenizer(inp, add_special_tokens=False).input_ids
@@ -169,8 +193,9 @@ def create_finetune_dataset(jsonl_path: str, tokenizer) -> Dataset:
     dataset = Dataset.from_list(processed_data)
     print(f"Dataset ready: {len(dataset)} examples")
     
-    # Validate labels
-    sample_batch = [dataset[0], dataset[1]]
+    # Validate labels（稳健性：避免样本过少时断言失败）
+    n_check = min(2, len(dataset))
+    sample_batch = [dataset[i] for i in range(n_check)]
     valid_labels = sum(1 for item in sample_batch for label in item["labels"] if label != -100)
     print(f"Valid label tokens in sample: {valid_labels}")
     assert valid_labels > 0, "Labels are all -100; check encode_if_example logic"
@@ -182,12 +207,30 @@ def normalize_text(text: str) -> str:
     """Normalize text for comparison."""
     return re.sub(r'\s+', ' ', text.strip())
 
-def ensure_ans(prompt: str) -> str:
-    p = prompt.rstrip()
-    return p if p.endswith(" <ANS>") else (p + " <ANS> ")
+def _sanitize_condition_line(s: str) -> str:
+    """
+    清洗生成的条件行，去除换行、冒号、行内注释、尾随分隔符，并简单配平右括号。
+    这样可以降低 AST 误判。
+    """
+    import re
+    # 只取第一行/到冒号为止
+    line = re.split(r'[\r\n:]', s, maxsplit=1)[0]
+    # 去掉行内注释
+    line = line.split('#', 1)[0]
+    # 去掉空白
+    line = line.strip()
+    # 去掉尾随分隔符（逗号、分号）
+    while line and line[-1] in ',;':
+        line = line[:-1].strip()
+    # 简单右括号配平（常见漏 1 个）
+    if line.count('(') > line.count(')'):
+        line += ')' * (line.count('(') - line.count(')'))
+    return line
 
 @torch.no_grad()
 def generate_prediction(model, tokenizer, input_text: str, max_new_tokens: int = 64) -> str:
+    # 确保 prompt 末尾恰好一个 <ANS>
+    input_text = ensure_ans(input_text)
     inputs = tokenizer(
         input_text,
         truncation=True,
@@ -201,55 +244,61 @@ def generate_prediction(model, tokenizer, input_text: str, max_new_tokens: int =
     generated = model.generate(
         input_ids=inputs["input_ids"],
         attention_mask=inputs["attention_mask"],
-        max_new_tokens=max_new_tokens,
+        max_new_tokens=min(max_new_tokens, 32),
         do_sample=False,
+        no_repeat_ngram_size=4,      # avoid "A and A and A..."
+        repetition_penalty=1.1,      # light penalty
         pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id
+        eos_token_id=tokenizer.eos_token_id,
     )
 
     input_length = inputs["input_ids"].shape[1]
     gen_tokens = generated[0][input_length:]
     text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
     
-    # Handle empty or invalid generation
     if not text or not text.strip():
-        return "True"  # Fallback prediction
-    
-    lines = text.splitlines()
-    if not lines:
-        return "True"  # Fallback prediction
-    
-    line = lines[0].strip()
-    if not line:
-        return "True"  # Fallback prediction
-        
-    return line.rstrip(':')
+        return "True"  # 合理兜底
+    return _sanitize_condition_line(text) or "True"
 
-def compute_metrics(eval_pred: EvalPrediction) -> Dict[str, float]:
-    """Compute metrics for evaluation using AST comparison."""
-    predictions, labels = eval_pred
-    predictions = np.argmax(predictions, axis=-1)
-    
-    # Calculate accuracy on non-ignored tokens (fallback)
-    mask = labels != -100
-    if mask.sum() > 0:
-        token_accuracy = (predictions[mask] == labels[mask]).mean()
-    else:
-        token_accuracy = 0.0
-    
-    # For now, return token accuracy as the main metric
-    # TODO: Implement proper AST-based evaluation in a custom trainer
-    return {
-        "accuracy": float(token_accuracy),
-        "token_accuracy": float(token_accuracy)
-    }
+def compute_metrics(eval_pred):
+    """
+    Proper token-level accuracy for causal LM:
+    compare argmax(logits[..., :-1, :]) with labels[..., 1:],
+    and ignore positions where labels == -100.
+    """
+    import numpy as np
+    global _FIRST_CM_CALLED
+
+    logits = eval_pred.predictions
+    # Some HF versions return (logits, ...) tuple
+    if isinstance(logits, (tuple, list)):
+        logits = logits[0]
+
+    labels = eval_pred.label_ids
+
+    # Shift for next-token prediction
+    pred_ids = np.argmax(logits, axis=-1)[..., :-1]   # [B, T-1]
+    labels   = labels[..., 1:]                        # [B, T-1]
+    mask = (labels != -100)
+
+    denom = mask.sum()
+    token_acc = float(((pred_ids == labels) & mask).sum() / denom) if denom > 0 else 0.0
+
+    if not _FIRST_CM_CALLED:
+        print(f"[compute_metrics] supervised tokens: {int(denom)} "
+              f"(batch={labels.shape[0]}, seq={labels.shape[1]})")
+        _FIRST_CM_CALLED = True
+
+    # Only one clean metric name
+    return {"token_accuracy": token_acc}
 
 class ASTEvaluatorTrainer(Trainer):
     """Custom trainer with AST-based evaluation."""
     
-    def __init__(self, *args, tokenizer=None, **kwargs):
+    def __init__(self, *args, tokenizer=None, enable_ast_eval=True, **kwargs):
         super().__init__(*args, tokenizer=tokenizer, **kwargs)
         self.tokenizer = tokenizer
+        self.enable_ast_eval = enable_ast_eval
     
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
         """Override evaluate to use AST-based comparison."""
@@ -262,13 +311,26 @@ class ASTEvaluatorTrainer(Trainer):
         # Copy output.metrics to a dict
         metrics = dict(output.metrics) if getattr(output, "metrics", None) else {}
         
+        if not self.enable_ast_eval:
+            # Skip AST accuracy during training
+            self.log(metrics)
+            return metrics
+        
         # Add AST-based evaluation only if fields exist
         from collections.abc import Mapping
         ok = len(eval_dataset) > 0 and isinstance(eval_dataset[0], Mapping) and \
              {'original_input','original_target'} <= set(eval_dataset[0].keys())
-        if ok:
+        
+        # Run AST eval only every AST_EVAL_EVERY-th evaluation
+        step_blocks = max(1, getattr(self.args, "eval_steps", 1))
+        do_ast = ((self.state.global_step // step_blocks) % AST_EVAL_EVERY == 0)
+        
+        if ok and do_ast:
+            print(f"\n=== Running AST Evaluation (step {self.state.global_step}) ===")
             ast_accuracy = self._compute_ast_accuracy(eval_dataset)
             metrics[f"{metric_key_prefix}_ast_accuracy"] = ast_accuracy
+            print(f"=== AST Evaluation Complete: {ast_accuracy:.3%} ===\n")
+            self.log({"ast_eval_samples": self._last_ast_n})
         
         self.log(metrics)
         
@@ -276,37 +338,29 @@ class ASTEvaluatorTrainer(Trainer):
     
     def _compute_ast_accuracy(self, eval_dataset):
         """Compute AST-based accuracy."""
-        self.model.eval()
+        import numpy as np
+        
+        # sample size: use eval dataset size directly, bounded
+        n = max(AST_EVAL_MIN, min(AST_EVAL_MAX, len(eval_dataset)))
+
+        rng = np.random.RandomState(0)
+        idxs = rng.choice(len(eval_dataset), size=n, replace=False)
+
         correct = 0
-        total = 0
-        
-        print(f"\n=== Computing AST Accuracy on {len(eval_dataset)} samples ===")
-        
-        with torch.no_grad():
-            for i in range(len(eval_dataset)):
-                # Get original text
-                original_input = eval_dataset[i]['original_input']
+        with torch.inference_mode():
+            for i in idxs:
+                original_input  = eval_dataset[i]['original_input']
                 original_target = eval_dataset[i]['original_target']
-                
-                # Generate prediction with consistent prompt format
                 prompt = ensure_ans(original_input)
-                prediction = generate_prediction(self.model, self.tokenizer, prompt)
-                
-                # Extract condition expressions
-                expected_condition = original_target.split('\n')[0].strip().rstrip(':')
-                predicted_condition = prediction.split('\n')[0].strip().rstrip(':')
-                
-                # Check correctness using AST comparison
-                if is_correct_ast(expected_condition, predicted_condition):
+                pred = generate_prediction(self.model, self.tokenizer, prompt, max_new_tokens=AST_EVAL_MAX_NEW)
+                exp = original_target.split('\n')[0].strip().rstrip(':')
+                got = pred.split('\n')[0].strip().rstrip(':')
+                if is_correct_ast(exp, got):
                     correct += 1
-                total += 1
-                
-                # Print progress every 100 samples
-                if (i + 1) % 100 == 0:
-                    print(f"  Processed {i+1}/{len(eval_dataset)} samples, current accuracy: {correct}/{total} = {correct/total*100:.2f}%")
-        
-        accuracy = correct / total if total > 0 else 0.0
-        print(f"AST Accuracy: {correct}/{total} = {accuracy*100:.2f}%")
+
+        self._last_ast_n = int(n)  # for logging
+        accuracy = correct / float(n)
+        print(f"AST Accuracy: {correct}/{n} = {accuracy*100:.2f}%")
         return accuracy
 
 def finetune_model(
@@ -323,6 +377,11 @@ def finetune_model(
     save_steps: int = 500,
     eval_steps: int = 500,
     early_stopping: int = 3,
+    disable_ast_eval: bool = True,
+    eval_subset_ratio: float = 0.05,
+    eval_subset_cap: int = 1000,
+    eval_token_acc: bool = False,
+    ast_eval_after: int = 0,
 ):
     """Fine-tune model for if-condition prediction."""
     global MAX_LEN
@@ -336,6 +395,19 @@ def finetune_model(
     print("\n=== Creating Datasets ===")
     train_dataset = create_finetune_dataset(train_file, tokenizer)
     val_dataset = create_finetune_dataset(val_file, tokenizer)
+    
+    # Keep a full copy for post-train probe, then create the eval subset
+    val_full = val_dataset
+    if eval_subset_ratio < 1.0 or (eval_subset_cap and eval_subset_cap > 0):
+        import random
+        random.seed(42)
+        n = int(len(val_dataset) * eval_subset_ratio)
+        if eval_subset_cap:
+            n = min(n, eval_subset_cap)
+        n = max(1, n)  # ensure at least 1
+        idx = random.sample(range(len(val_dataset)), n)
+        val_dataset = val_dataset.select(idx)
+    print(f"Eval subset: {len(val_dataset)} / {len(val_full)}")
     
     # Create data collator
     data_collator = DefaultDataCollator()
@@ -354,7 +426,7 @@ def finetune_model(
         disable_tqdm=False,            
         logging_steps=50,              
         logging_first_step=True,       
-        eval_strategy="steps",   
+        eval_strategy="steps",
         eval_steps=eval_steps,               
         save_strategy="steps",         
         save_steps=save_steps,
@@ -370,28 +442,78 @@ def finetune_model(
         dataloader_num_workers=0,  # Use single-worker dataloader to avoid hanging
         max_grad_norm=1.0,  # Gradient clipping
         warmup_ratio=0.1,  # 10% warmup
+        prediction_loss_only=not eval_token_acc,  # key: no logits unless we need token acc
     )
     
     # Create trainer
     # Enable gradient checkpointing to reduce activation memory
     try:
         model.gradient_checkpointing_enable()
+        model.config.use_cache = False
     except Exception:
         pass
 
-    trainer = ASTEvaluatorTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics,
-        tokenizer=tokenizer,  # Add tokenizer for AST evaluation
-    )
+    # Choose trainer class
+    use_ast_trainer = (not disable_ast_eval)
+    if use_ast_trainer:
+        print("WARNING: AST eval during training is ENABLED (slow/heavy).")
+    else:
+        print("AST eval during training is DISABLED (default). Using standard Trainer.")
+
+    # compute_metrics only if we need token accuracy
+    cm = compute_metrics if eval_token_acc else None
+
+    if use_ast_trainer:
+        trainer = ASTEvaluatorTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=val_dataset,
+            data_collator=data_collator,
+            compute_metrics=cm,
+            tokenizer=tokenizer,
+            enable_ast_eval=True,
+        )
+    else:
+        from transformers import Trainer
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=val_dataset,
+            data_collator=data_collator,
+            compute_metrics=cm,
+            tokenizer=tokenizer,
+        )
     
     # Train
     print("\n=== Starting Training ===")
     trainer.train()
+
+    # --- Sanity check: one-batch token acc ---
+    try:
+        eval_loader = trainer.get_eval_dataloader()
+        batch = next(iter(eval_loader))
+        model.eval()
+        with torch.no_grad():
+            out = model(
+                input_ids=batch["input_ids"].to(model.device),
+                attention_mask=batch["attention_mask"].to(model.device),
+                labels=batch["labels"].to(model.device)
+            )
+        logits = out.logits.detach().cpu().numpy()
+        labels = batch["labels"].detach().cpu().numpy()
+
+        pred = logits.argmax(-1)[:, :-1]
+        lab  = labels[:, 1:]
+        mask = (lab != -100)
+        denom = mask.sum()
+        one_batch_acc = float(((pred == lab) & mask).sum() / denom) if denom > 0 else 0.0
+        print(f"[sanity] one-batch token_acc = {one_batch_acc:.4f} "
+              f"(supervised tokens={int(denom)})")
+    except Exception as e:
+        print(f"[sanity] failed: {e}")
+    # --- end sanity check ---
     
     # Save model
     print(f"\n=== Saving Model to {output_dir} ===")
@@ -399,6 +521,27 @@ def finetune_model(
     tokenizer.save_pretrained(output_dir)
     
     print("=== Fine-tuning Complete ===")
+    
+    # Post-train AST probe on a small subset if requested
+    if ast_eval_after and ast_eval_after > 0:
+        import random
+        random.seed(42)
+        k = min(ast_eval_after, len(val_full))
+        probe_idx = random.sample(range(len(val_full)), k)
+        correct = 0
+        for i, j in enumerate(probe_idx, 1):
+            original_input = val_full[j]['original_input']
+            original_target = val_full[j]['original_target']
+            prompt = ensure_ans(original_input)
+            pred = generate_prediction(model, tokenizer, prompt)
+            exp = original_target.split('\n')[0].strip().rstrip(':')
+            got = pred.split('\n')[0].strip().rstrip(':')
+            if is_correct_ast(exp, got):
+                correct += 1
+            if i % 50 == 0:
+                print(f"[AST probe] {i}/{k}: running acc={correct/i:.3f}")
+        final_acc = correct / k if k > 0 else 0.0
+        print(f"\n=== Post-train AST probe on {k} samples: acc={final_acc:.3%} ===")
     
     # Test prediction
     print("\n=== Testing Prediction ===")
@@ -428,6 +571,16 @@ def main():
     parser.add_argument("--save-steps", type=int, default=500, help="Save steps")
     parser.add_argument("--eval-steps", type=int, default=500, help="Eval steps")
     parser.add_argument("--early-stopping", type=int, default=3, help="Early stopping patience")
+    parser.add_argument("--disable-ast-eval", action="store_true", default=True,
+                        help="If set (default), skip AST-based evaluation during training/eval.")
+    parser.add_argument("--eval-subset-ratio", type=float, default=0.05,
+                        help="Fraction of val set used each eval step (default 0.05).")
+    parser.add_argument("--eval-subset-cap", type=int, default=1000,
+                        help="Cap for number of val examples per eval (default 1000).")
+    parser.add_argument("--eval-token-acc", action="store_true", default=False,
+                        help="If set, compute token-level accuracy during eval (uses logits; more RAM).")
+    parser.add_argument("--ast-eval-after", type=int, default=0,
+                        help="If >0, run AST evaluation on a random subset of this size after training.")
     
     args = parser.parse_args()
     
@@ -463,6 +616,11 @@ def main():
         save_steps=args.save_steps,
         eval_steps=args.eval_steps,
         early_stopping=args.early_stopping,
+        disable_ast_eval=args.disable_ast_eval,
+        eval_subset_ratio=args.eval_subset_ratio,
+        eval_subset_cap=args.eval_subset_cap,
+        eval_token_acc=args.eval_token_acc,
+        ast_eval_after=args.ast_eval_after,
     )
 
 if __name__ == "__main__":

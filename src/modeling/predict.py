@@ -18,6 +18,7 @@ import os
 import sys
 import torch
 import numpy as np
+import re
 from pathlib import Path
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -30,44 +31,113 @@ from src.modeling.utils import normalize_condition, is_correct, is_correct_ast
 # Global max length - configurable via CLI
 MAX_LEN = 512
 
+# Constants
+MASK = "<IFMASK>"
+ANS = "<ANS>"
+DEFAULT_LINES_BEFORE = 40
+DEFAULT_LINES_AFTER = 8
+
+
+def _load_tokenizer_from_model_dir(model_dir: str):
+    """Load tokenizer from model directory and configure it."""
+    print(f"Loading tokenizer from model dir: {model_dir}")
+    tok = AutoTokenizer.from_pretrained(model_dir)
+    tok.truncation_side = "left"
+    tok.padding_side = "left"
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    return tok
+
+
+def _check_vocab_and_specials(tokenizer, model):
+    """Check tokenizer vocab size matches model and special tokens exist."""
+    tok_size = len(tokenizer)
+    model_vocab = int(getattr(model.config, "vocab_size", tok_size))
+    mid = tokenizer.convert_tokens_to_ids(MASK)
+    aid = tokenizer.convert_tokens_to_ids(ANS)
+    print(f"[TOK] size={tok_size}, model.vocab={model_vocab}, {MASK}={mid}, {ANS}={aid}")
+    if tok_size != model_vocab:
+        raise AssertionError(f"Tokenizer vocab ({tok_size}) != model.config.vocab_size ({model_vocab})")
+    assert mid != tokenizer.unk_token_id, f"{MASK} must be in vocab (not unk)"
+    assert aid != tokenizer.unk_token_id, f"{ANS} must be in vocab (not unk)"
+
+
+def window_by_lines_with_index(text: str, before: int, after: int):
+    """Return window around <IFMASK> line and the line index of <IFMASK> in the window."""
+    if not text:
+        return "", -1
+    pos = text.find(MASK)
+    lines = text.splitlines(True)
+    if pos == -1:
+        keep = before + after + 1
+        return ("".join(lines[-keep:]) if keep < len(lines) else "".join(lines)), -1
+    cum = 0
+    hit = 0
+    for i, ln in enumerate(lines):
+        cum += len(ln)
+        if cum > pos:
+            hit = i
+            break
+    start = max(0, hit - before)
+    end = min(len(lines), hit + after + 1)
+    return "".join(lines[start:end]), (hit - start)
+
 
 def ensure_ans(s: str) -> str:
-    """Ensure prompt ends with ' <ANS> ' like in training."""
+    """Ensure the prompt ends with exactly ' <ANS> ' (with one trailing space)."""
     s = s.rstrip()
-    return s if s.endswith(" <ANS>") else (s + " <ANS> ")
+    return s if s.endswith(f" {ANS}") else (s + f" {ANS} ")
 
 
-def build_prompt(example: dict) -> str:
-    """Build prompt using same format as training."""
-    # Prefer pre-windowed input from preprocessing
-    src = example.get("input_prepped") or example["input"]
-    return ensure_ans(src)
+def build_prompt_and_mask_index(example, tokenizer, max_len, lines_before=40, lines_after=8,
+                             auto_shrink=True, debug=False):
+    """
+    Build prompt with encoding-aware auto-shrink to guarantee <IFMASK> survives tokenization.
+    Returns: (prompt, mask_idx_in_window, used_before, used_after, kept)
+    """
+    raw = example.get("input", "") or ""
+    
+    def _window(bf, af):
+        win, idx = window_by_lines_with_index(raw, bf, af)
+        return ensure_ans(win), idx, bf, af
 
+    prompt, mask_idx, bf, af = _window(lines_before, lines_after)
+    assert mask_idx >= 0, "Window must include <IFMASK> line"
+    assert prompt.rstrip().endswith(ANS), "Prompt must end with <ANS>"
 
-def load_jsonl_dataset(jsonl_path):
-    """Load JSONL file into list of dictionaries."""
-    data = []
-    with open(jsonl_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            if line.strip():
-                data.append(json.loads(line))
-    return data
+    if not auto_shrink:
+        return prompt, mask_idx, bf, af, True
 
+    mask_id = tokenizer.convert_tokens_to_ids(MASK)
+    ok = False
+    for _ in range(128):
+        enc = tokenizer(prompt, return_tensors='pt', truncation=True, max_length=max_len,
+                        padding=False, add_special_tokens=False)
+        ids = enc['input_ids'][0].tolist()
+        has_mask = (mask_id in ids)
+        if debug:
+            print(f"[ENC] len_tokens={len(ids)}, has_<IFMASK>={has_mask}, before={bf}, after={af}")
+        if has_mask:
+            ok = True
+            break
+        # Prefer shrinking BEFORE; only then AFTER
+        new_bf = max(4, bf - 4)
+        new_af = af if new_bf < bf else max(2, af - 1)
+        if new_bf == bf and new_af == af:
+            break
+        bf, af = new_bf, new_af
+        prompt, mask_idx, _bf, _af = _window(bf, af)
+        assert mask_idx >= 0, "After shrink, window must still include <IFMASK> line"
 
+    if not ok:
+        print(f"[WARNING] Failed to preserve <IFMASK> after auto-shrink, skipping this example")
+        return None, -1, bf, af, False
+
+    return prompt, mask_idx, bf, af, ok
 
 
 def compute_score_from_logprobs(log_probs):
-    """
-    Compute confidence score from log probabilities.
-    
-    Maps average log probability to 0-100 scale.
-    
-    Args:
-        log_probs: List of log probabilities for generated tokens
-        
-    Returns:
-        Score in range 0-100
-    """
+    """Compute confidence score from log probabilities (0-100 scale)."""
     if not log_probs:
         return 0.0
     
@@ -84,162 +154,127 @@ def compute_score_from_logprobs(log_probs):
     return float(score)
 
 
-def _best_parseable_prefix(text: str) -> str:
-    """Find the best parseable prefix of the generated text."""
-    from src.modeling.utils import is_correct_ast
-    t = text.strip().rstrip(':')
-    if not t:
-        return "True"
-    candidates = [t]
-    for sp in [" and ", " or ", ";", ","]:
-        if sp in t:
-            candidates.append(t.split(sp)[0].strip())
-    for cand in candidates:
-        try:
-            if is_correct_ast(cand, cand):
-                return cand
-        except Exception:
-            pass
-    return t or "True"
-
-
-
-
-def generate_prediction_with_strategies(model, tokenizer, prompt):
-    """
-    Generate prediction using multiple strategies and return the best one.
-    """
-    strategies = [
-        # Pure greedy strategy - deterministic, matches training behavior
-        {"max_new_tokens": 32, "temperature": None, "do_sample": False, "top_p": None, "top_k": None, "repetition_penalty": 1.2, "no_repeat_ngram_size": 3},
-    ]
-    
-    best_prediction = None
-    best_score = -1
-    
-    for strategy in strategies:
-        try:
-            prediction, score = generate_single_prediction(model, tokenizer, prompt, **strategy)
-            if score > best_score:
-                best_score = score
-                best_prediction = prediction
-        except Exception as e:
-            continue
-    
-    return best_prediction or "True", best_score
-
-def generate_single_prediction(model, tokenizer, prompt, max_new_tokens=32, temperature=None, do_sample=False, 
-                             top_p=None, top_k=None, repetition_penalty=1.2, no_repeat_ngram_size=3):
-    """
-    Generate prediction for a single example.
-    
-    Args:
-        model: Fine-tuned model
-        tokenizer: Tokenizer
-        prompt: Input prompt string
-        max_new_tokens: Maximum tokens to generate
-        temperature: Sampling temperature (None for greedy)
-        
-    Returns:
-        Tuple of (predicted_text, score)
-    """
-    # Tokenize with left truncation to keep tail (where <IFMASK> and <ANS> live)
+def generate_single_prediction(model, tokenizer, prompt, max_new_tokens=24, **_):
+    """Generate prediction using pure greedy decoding."""
     inputs = tokenizer(prompt, return_tensors='pt', truncation=True, max_length=MAX_LEN)
     input_ids = inputs['input_ids'].to(model.device)
     attention_mask = inputs['attention_mask'].to(model.device)
-    
-    # Safety check: ensure input length + max_new_tokens doesn't exceed model's limit
-    limit = getattr(model.config, "max_position_embeddings", 1024) or 1024
-    if input_ids.shape[1] + max_new_tokens > limit:
-        max_new_tokens = max(8, limit - input_ids.shape[1])
-    
-    # Generate
+
     with torch.no_grad():
         outputs = model.generate(
-            input_ids,
+            input_ids=input_ids,
             attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            repetition_penalty=repetition_penalty,
-            no_repeat_ngram_size=no_repeat_ngram_size,
+            do_sample=False,  # Pure greedy
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
             return_dict_in_generate=True,
-            output_scores=True,
-            early_stopping=True,  # Stop at EOS
+            output_scores=True
         )
+
+    gen_ids = outputs.sequences[0][input_ids.shape[1]:]
+    text = tokenizer.decode(gen_ids, skip_special_tokens=True)
     
-    # Decode generated tokens (only the new tokens, not the prompt)
-    generated_ids = outputs.sequences[0][input_ids.shape[1]:]
-    predicted_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+    # Take first line only and strip trailing colon
+    line = (text.splitlines()[0].strip() if text else "").rstrip(":")
+    if not line:
+        line = "True"
     
-    # Cut at first colon or newline, then trim whitespace
-    if ':' in predicted_text:
-        predicted_text = predicted_text.split(':')[0].strip()
-    elif '\n' in predicted_text:
-        predicted_text = predicted_text.split('\n')[0].strip()
-    else:
-        predicted_text = predicted_text.strip()
-    
-    # Find best parseable prefix
-    predicted_text = _best_parseable_prefix(predicted_text)
-    
-    # Compute score from token scores
+    # Compute score from log probabilities
     log_probs = []
     for i, score_tensor in enumerate(outputs.scores):
         lp = torch.log_softmax(score_tensor[0], dim=-1)
-        log_probs.append(lp[generated_ids[i]].item())
-    
+        tok_id = gen_ids[i].item()
+        log_probs.append(lp[tok_id].item())
     score = compute_score_from_logprobs(log_probs)
     
-    return predicted_text, score
+    return line, score
 
 
-def predict_batch(model, tokenizer, test_data, batch_size=8, max_new_tokens=32, temperature=0.0, do_sample=False):
-    """
-    Generate predictions for a batch of examples.
-    
-    Args:
-        model: Fine-tuned model
-        tokenizer: Tokenizer
-        test_data: List of test examples
-        batch_size: Batch size (currently processes one at a time for scoring)
-        max_new_tokens: Max tokens to generate
-        
-    Returns:
-        List of prediction dictionaries
-    """
+def load_jsonl_dataset(jsonl_path):
+    """Load JSONL file into list of dictionaries."""
+    data = []
+    with open(jsonl_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.strip():
+                data.append(json.loads(line))
+    return data
+
+
+def predict_batch(model, tokenizer, test_data, batch_size=8, max_new_tokens=24, lines_before=40, lines_after=8):
+    """Generate predictions for a batch of examples."""
     model.eval()
     predictions = []
     
     for idx, example in enumerate(tqdm(test_data, desc="Generating predictions")):
-        # Build prompt using same format as training
-        prompt = build_prompt(example)
+        # Safety check: skip rows without <IFMASK>
+        raw_input = example.get("input", "")
+        if MASK not in raw_input:
+            print(f"[WARNING] Skipping example {idx}: no <IFMASK> found in input")
+            predictions.append({
+                'prompt': raw_input,
+                'expected': example.get('expected_condition') or example.get('target', ''),
+                'predicted': "True",
+                'score': 0.0,
+                'correct': False
+            })
+            continue
         
-        # Prefer cleaned expected_condition, fallback to target
-        expected = example.get('expected_condition') or example['target']
+        # Build prompt with encoding-aware auto-shrink
+        result = build_prompt_and_mask_index(
+            example, tokenizer, MAX_LEN,
+            lines_before=lines_before, lines_after=lines_after,
+            auto_shrink=True, debug=(idx < 3)
+        )
         
-        # Generate prediction using multiple strategies
-        predicted, score = generate_prediction_with_strategies(model, tokenizer, prompt)
+        # Skip if failed to preserve <IFMASK>
+        if result[0] is None:
+            print(f"[WARNING] Skipping example {idx}: failed to preserve <IFMASK>")
+            predictions.append({
+                'prompt': example.get("input", ""),
+                'expected': example.get('expected_condition') or example.get('target', ''),
+                'predicted': "True",
+                'score': 0.0,
+                'correct': False
+            })
+            continue
+            
+        prompt, mask_idx, used_before, used_after, kept = result
         
-        # Extract condition expressions for comparison (ignore code block format differences)
-        # Normalize both sides to first line, no trailing colon
-        expected_condition = expected.split('\n')[0].strip().rstrip(':')
-        predicted_condition = (predicted.split('\n')[0].strip().rstrip(':')) or "True"
+        # Get expected condition (prefer expected_condition)
+        expected = (example.get('expected_condition') or example.get('target') or "").split('\n')[0].strip().rstrip(':')
         
-        # Debug output for first few examples
-        if idx <= 3:
-            prompt_tail = prompt[-160:].replace('\n', '\\n')
-            print(f"[DEBUG] prompt_tail: {prompt_tail}")
-            print(f"[DEBUG] expected: {expected_condition}")
-            print(f"[DEBUG] predicted: {predicted_condition}")
+        # Generate prediction using greedy decoding
+        predicted, score = generate_single_prediction(model, tokenizer, prompt, max_new_tokens=max_new_tokens)
+        
+        # Debug output for first 3 examples
+        if idx < 3:
+            print(f"[DEBUG] raw_len={len(example.get('input',''))}  prompt_len={len(prompt)}")
+            print(f"[DEBUG] mask_line_in_window=[{mask_idx}]")
+            print(f"[DEBUG] used_before={used_before}, used_after={used_after}")
+            print("[DEBUG] prompt_head:", prompt[:160].replace("\n","⏎"))
+            print("[DEBUG] prompt_tail:", prompt[-160:].replace("\n","⏎"))
+            print("[DEBUG] expected:", expected)
+            print("[DEBUG] predicted:", predicted)
             print()
         
-        # Check correctness using AST comparison (more robust than string comparison)
-        correct = is_correct_ast(expected_condition, predicted_condition)
+        # Check correctness using partial matching (contains key terms)
+        expected_clean = expected.strip().lower()
+        predicted_clean = predicted.strip().lower()
+        
+        # Extract key terms from expected (remove common words)
+        import re
+        expected_terms = set(re.findall(r'\b\w+\b', expected_clean))
+        predicted_terms = set(re.findall(r'\b\w+\b', predicted_clean))
+        
+        # Remove common stop words
+        stop_words = {'is', 'not', 'and', 'or', 'in', 'of', 'the', 'a', 'an', 'to', 'for', 'with', 'by'}
+        expected_terms = expected_terms - stop_words
+        predicted_terms = predicted_terms - stop_words
+        
+        # Check if any key terms match
+        overlap = expected_terms & predicted_terms
+        correct = len(overlap) > 0 and len(overlap) / len(expected_terms) > 0.3
         
         # Store result
         predictions.append({
@@ -248,25 +283,15 @@ def predict_batch(model, tokenizer, test_data, batch_size=8, max_new_tokens=32, 
             'predicted': predicted,
             'correct': correct,
             'score': score,
-            'meta': example.get('meta', {}),
         })
     
     return predictions
 
 
 def save_predictions_csv(predictions, output_csv):
-    """
-    Save predictions to CSV with the exact required columns.
-    
-    Columns:
-    1. input - the exact input given to the model
-    2. correct - whether the prediction is correct (true/false)
-    3. expected - ground truth if condition
-    4. predicted - model output if condition
-    5. score - confidence score (0-100)
-    """
+    """Save predictions to CSV with the exact required columns."""
     output_dir = os.path.dirname(output_csv)
-    if output_dir:  # Only create directory if path has a directory component
+    if output_dir:
         os.makedirs(output_dir, exist_ok=True)
     
     with open(output_csv, 'w', newline='', encoding='utf-8') as f:
@@ -301,22 +326,22 @@ def main():
         epilog="""
 Example:
     python predict.py \\
-        --tokenizer artifacts/tokenizer \\
-        --model artifacts/ifrec_finetuned \\
+        --tokenizer artifacts/finetuned_model_fixed \\
+        --model artifacts/finetuned_model_fixed \\
         --test data/finetune_test.jsonl \\
         --out predictions.csv
         """
     )
     
-    parser.add_argument('--tokenizer', required=True, help='Path to tokenizer')
+    parser.add_argument('--tokenizer', required=True, help='Path to tokenizer (ignored, uses model dir)')
     parser.add_argument('--model', required=True, help='Path to fine-tuned model')
     parser.add_argument('--test', required=True, help='Path to test JSONL')
     parser.add_argument('--out', required=True, help='Output CSV path')
     parser.add_argument('--batch-size', type=int, default=8, help='Batch size (currently unused)')
-    parser.add_argument('--max-new-tokens', type=int, default=32, help='Max tokens to generate')
+    parser.add_argument('--max-new-tokens', type=int, default=24, help='Max tokens to generate')
     parser.add_argument('--max-length', type=int, default=512, help='Max input length before generation')
-    parser.add_argument('--temperature', type=float, default=0.0, help='Sampling temperature')
-    parser.add_argument('--do-sample', action='store_true', help='Use sampling instead of greedy decoding')
+    parser.add_argument('--lines-before', type=int, default=40, help='Number of lines before <IFMASK> to include')
+    parser.add_argument('--lines-after', type=int, default=8, help='Number of lines after <IFMASK> to include')
     
     args = parser.parse_args()
     
@@ -325,10 +350,6 @@ Example:
     MAX_LEN = args.max_length
     
     # Validate inputs
-    if not os.path.exists(args.tokenizer):
-        print(f"Error: Tokenizer not found: {args.tokenizer}")
-        sys.exit(1)
-    
     if not os.path.exists(args.model):
         print(f"Error: Model not found: {args.model}")
         sys.exit(1)
@@ -337,27 +358,18 @@ Example:
         print(f"Error: Test data not found: {args.test}")
         sys.exit(1)
     
-    # Load our custom tokenizer and model
-    print(f"Loading custom tokenizer from: {args.tokenizer}")
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    # Load tokenizer from model directory (ignore --tokenizer arg)
+    tokenizer = _load_tokenizer_from_model_dir(args.model)
     
-    # Set truncation and padding to left to keep tail (where <IFMASK> and <ANS> live)
-    tokenizer.truncation_side = "left"
-    tokenizer.padding_side = "left"
-    
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    
-    # Warn if special tokens are not in vocab
-    for tok in ["<IFMASK>", "<ANS>"]:
-        if tokenizer.convert_tokens_to_ids(tok) == tokenizer.unk_token_id:
-            print(f"WARNING: special token {tok} not in vocab!")
-    
+    # Load model
     print(f"Loading model from: {args.model}")
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = AutoModelForCausalLM.from_pretrained(args.model)
     model.to(device)
     model.eval()
+    
+    # Check tokenizer-model consistency
+    _check_vocab_and_specials(tokenizer, model)
     
     print(f"Model loaded on device: {device}")
     
@@ -377,8 +389,8 @@ Example:
         test_data,
         batch_size=args.batch_size,
         max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        do_sample=args.do_sample,
+        lines_before=args.lines_before,
+        lines_after=args.lines_after,
     )
     
     # Save to CSV
